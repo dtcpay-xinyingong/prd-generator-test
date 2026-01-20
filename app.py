@@ -6,6 +6,8 @@ Generates API Integration PRDs using Claude AI.
 import streamlit as st
 import anthropic
 import re
+import requests
+import html2text
 
 # Page config
 st.set_page_config(
@@ -32,7 +34,7 @@ st.markdown("""
 
 # System prompt for PRD generation
 SYSTEM_PROMPT = """You are an API documentation analyst.
-When given an API documentation URL, you will:
+When given API documentation content, you will:
 
 1. Analyze the API documentation
 2. Generate a complete Integration PRD with:
@@ -56,18 +58,51 @@ Keep the PRD concise but actionable for a development team.
 Output format: Markdown"""
 
 
+def fetch_url_content(url: str) -> str:
+    """Fetch URL and convert HTML to readable text."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PRDGenerator/1.0)"
+    }
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+
+    # Convert HTML to markdown-like text
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True
+    h.body_width = 0  # Don't wrap lines
+
+    content = h.handle(response.text)
+
+    # Truncate if too long (Claude has context limits)
+    max_chars = 100000
+    if len(content) > max_chars:
+        content = content[:max_chars] + "\n\n[Content truncated due to length...]"
+
+    return content
+
+
 def generate_prd(url: str, api_key: str) -> str:
     """Fetch API docs and generate PRD using Claude."""
 
+    # Step 1: Fetch the URL content
+    with st.spinner("Fetching API documentation..."):
+        docs_content = fetch_url_content(url)
+
+    # Step 2: Send content to Claude for analysis
     client = anthropic.Anthropic(api_key=api_key)
 
-    prompt = f"""Generate a complete API Integration PRD for the API documented at: {url}
+    prompt = f"""Generate a complete API Integration PRD based on the following API documentation.
 
-Please:
-1. First, analyze the API documentation at that URL
-2. Then generate a comprehensive but concise Integration PRD
+Source URL: {url}
 
-Include:
+## API Documentation Content:
+
+{docs_content}
+
+---
+
+Please generate a comprehensive but concise Integration PRD that includes:
 - Executive summary (objective, provider, complexity)
 - Quick reference table (base URL, auth, rate limits)
 - Authentication details
@@ -80,7 +115,7 @@ Include:
 
 Make it actionable for a development team."""
 
-    with st.spinner("Fetching API documentation and generating PRD..."):
+    with st.spinner("Analyzing documentation and generating PRD..."):
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8000,
@@ -187,6 +222,8 @@ def main():
                 mime="text/markdown"
             )
 
+        except requests.exceptions.RequestException as e:
+            st.error(f"Failed to fetch URL: {str(e)}")
         except anthropic.AuthenticationError:
             st.error("Invalid API key. Please check your Anthropic API key.")
         except anthropic.RateLimitError:
