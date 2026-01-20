@@ -135,23 +135,21 @@ def elliptic_sign_request(method: str, path: str, body: str, secret: str) -> tup
     return signature_b64, timestamp
 
 
-def test_elliptic_api(api_key: str, api_secret: str, tx_hash: str, address: str) -> dict:
+def test_elliptic_api(api_key: str, api_secret: str, body: str) -> dict:
     """Test Elliptic API and return response."""
     base_url = "https://aml-api.elliptic.co"
     path = "/v2/analyses/synchronous"
 
-    body = json.dumps({
-        "subject": {
-            "asset": "holistic",
-            "blockchain": "holistic",
-            "type": "transaction",
-            "hash": tx_hash,
-            "output_type": "address",
-            "output_address": address
-        },
-        "type": "source_of_funds",
-        "customer_reference": "prd-generator-test"
-    }, separators=(',', ':'))
+    # Normalize the body JSON
+    try:
+        parsed_body = json.loads(body)
+        body = json.dumps(parsed_body, separators=(',', ':'))
+    except json.JSONDecodeError:
+        return {
+            "status_code": 0,
+            "response": "Invalid JSON body",
+            "success": False
+        }
 
     signature, timestamp = elliptic_sign_request("POST", path, body, api_secret)
 
@@ -345,16 +343,24 @@ def main():
                 help="Base64-encoded secret for HMAC signing"
             )
 
-            with st.expander("Test Transaction (Optional)"):
-                api_test_config["tx_hash"] = st.text_input(
-                    "Transaction Hash",
-                    value="f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
-                    help="Default: First BTC transaction (Satoshi → Hal Finney)"
-                )
-                api_test_config["address"] = st.text_input(
-                    "Address",
-                    value="1Q2TWHE3GMdB6BZKafqwxXtWAWgFt5Jvm3",
-                    help="Address to analyze"
+            default_body = '''{
+  "subject": {
+    "asset": "holistic",
+    "blockchain": "holistic",
+    "type": "transaction",
+    "hash": "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+    "output_type": "address",
+    "output_address": "1Q2TWHE3GMdB6BZKafqwxXtWAWgFt5Jvm3"
+  },
+  "type": "source_of_funds",
+  "customer_reference": "prd-generator-test"
+}'''
+            with st.expander("Request Body", expanded=True):
+                api_test_config["body"] = st.text_area(
+                    "JSON Body",
+                    value=default_body,
+                    height=250,
+                    help="Edit the JSON body for the API test request"
                 )
 
         elif provider in ["generic_bearer", "generic_api_key"]:
@@ -407,8 +413,7 @@ def main():
                     result = test_elliptic_api(
                         api_test_config["api_key"],
                         api_test_config["api_secret"],
-                        api_test_config.get("tx_hash", "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16"),
-                        api_test_config.get("address", "1Q2TWHE3GMdB6BZKafqwxXtWAWgFt5Jvm3")
+                        api_test_config.get("body", "{}")
                     )
                     if result["success"]:
                         st.success(f"✓ API test successful (Risk Score: {result['response'].get('risk_score', 'N/A')})")
