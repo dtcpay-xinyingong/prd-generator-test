@@ -262,6 +262,93 @@ Make it actionable for a development team."""
     return response.content[0].text
 
 
+def validate_prd(api_key: str, prd_content: str, docs_content: str, api_test_result: str = None) -> str:
+    """Validate PRD against source documentation."""
+    client = anthropic.Anthropic(api_key=api_key)
+
+    validation_prompt = f"""You are a technical reviewer validating an API Integration PRD against its source documentation.
+
+## Generated PRD:
+
+{prd_content}
+
+---
+
+## Source Documentation:
+
+{docs_content}
+"""
+
+    if api_test_result:
+        validation_prompt += f"""
+
+---
+
+## Live API Response (Ground Truth):
+
+{api_test_result}
+"""
+
+    validation_prompt += """
+
+---
+
+## Your Task
+
+Review the PRD for accuracy against the source documentation and live API response (if provided).
+
+For each section of the PRD, provide:
+
+### 1. Accuracy Check
+| Section | Status | Issue (if any) |
+|---------|--------|----------------|
+| Base URL | ✅ Verified / ⚠️ Issue / ❓ Unverifiable | Description |
+| Auth Method | ... | ... |
+| Endpoints | ... | ... |
+| Request Schema | ... | ... |
+| Response Schema | ... | ... |
+| Error Codes | ... | ... |
+| Rate Limits | ... | ... |
+
+### 2. Discrepancies Found
+List any specific discrepancies between the PRD and source docs:
+- [Field/Section]: PRD says X, but docs say Y
+
+### 3. Inferred Content
+List sections where the PRD contains information NOT found in the source docs (marked as inferred/assumed):
+- [Section]: This appears to be inferred because...
+
+### 4. Missing Information
+List important details from the docs that are missing from the PRD:
+- [Topic]: The docs mention X but PRD doesn't cover it
+
+### 5. Live Response Validation (if applicable)
+Compare PRD examples against the actual API response:
+- Fields match: [list]
+- Fields differ: [list with differences]
+- Fields missing from PRD: [list]
+
+### 6. Confidence Score
+Overall confidence in PRD accuracy: [HIGH / MEDIUM / LOW]
+Reasoning: [brief explanation]
+
+### 7. Recommended Fixes
+Prioritized list of corrections needed:
+1. [Most critical fix]
+2. [Next fix]
+...
+
+Be thorough and specific. Reference exact field names and values when noting discrepancies."""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4000,
+        messages=[{"role": "user", "content": validation_prompt}]
+    )
+
+    return response.content[0].text
+
+
 def get_api_key():
     """Get API key from secrets or user input."""
     if "ANTHROPIC_API_KEY" in st.secrets:
@@ -291,6 +378,14 @@ def main():
                 type="password",
                 help="Get your API key from console.anthropic.com"
             )
+
+        st.markdown("---")
+
+        enable_validation = st.checkbox(
+            "Enable PRD Validation",
+            value=True,
+            help="Run a second pass to validate PRD accuracy against source docs"
+        )
 
         st.markdown("---")
         st.markdown("### About")
@@ -442,22 +537,48 @@ def main():
 
             st.success("✓ PRD generated successfully!")
 
+            # Step 4: Validate PRD (if enabled)
+            validation_result = None
+            if enable_validation:
+                with st.spinner("Validating PRD accuracy..."):
+                    validation_result = validate_prd(claude_api_key, prd_content, docs_content, api_test_result)
+                st.success("✓ Validation complete!")
+
             # Display tabs
-            tab1, tab2 = st.tabs(["📄 PRD Document", "📋 Raw Markdown"])
+            if validation_result:
+                tab1, tab2, tab3 = st.tabs(["📄 PRD Document", "✅ Validation Report", "📋 Raw Markdown"])
+            else:
+                tab1, tab2, tab3 = st.tabs(["📄 PRD Document", "✅ Validation Report", "📋 Raw Markdown"])
 
             with tab1:
                 st.markdown(prd_content)
 
             with tab2:
+                if validation_result:
+                    st.markdown(validation_result)
+                else:
+                    st.info("Validation was skipped. Enable it in the sidebar to validate PRD accuracy.")
+
+            with tab3:
                 st.code(prd_content, language="markdown")
 
-            # Download button
-            st.download_button(
-                label="Download PRD as Markdown",
-                data=prd_content,
-                file_name=f"PRD-{re.sub(r'[^a-zA-Z0-9]', '-', url)[:30]}.md",
-                mime="text/markdown"
-            )
+            # Download buttons
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.download_button(
+                    label="Download PRD",
+                    data=prd_content,
+                    file_name=f"PRD-{re.sub(r'[^a-zA-Z0-9]', '-', url)[:30]}.md",
+                    mime="text/markdown"
+                )
+            with col_dl2:
+                if validation_result:
+                    st.download_button(
+                        label="Download Validation Report",
+                        data=validation_result,
+                        file_name=f"Validation-{re.sub(r'[^a-zA-Z0-9]', '-', url)[:30]}.md",
+                        mime="text/markdown"
+                    )
 
         except requests.exceptions.RequestException as e:
             st.error(f"Failed to fetch URL: {str(e)}")
