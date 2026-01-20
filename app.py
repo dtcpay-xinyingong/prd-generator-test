@@ -349,6 +349,74 @@ Be thorough and specific. Reference exact field names and values when noting dis
     return response.content[0].text
 
 
+def correct_prd(api_key: str, prd_content: str, validation_result: str, docs_content: str, api_test_result: str = None) -> str:
+    """Correct PRD based on validation feedback."""
+    client = anthropic.Anthropic(api_key=api_key)
+
+    correction_prompt = f"""You are an API documentation analyst tasked with correcting a PRD based on validation feedback.
+
+## Current PRD (needs corrections):
+
+{prd_content}
+
+---
+
+## Validation Report (issues to fix):
+
+{validation_result}
+
+---
+
+## Source Documentation (ground truth):
+
+{docs_content}
+"""
+
+    if api_test_result:
+        correction_prompt += f"""
+
+---
+
+## Live API Response (ground truth):
+
+{api_test_result}
+"""
+
+    correction_prompt += """
+
+---
+
+## Your Task
+
+Generate a CORRECTED version of the PRD that addresses ALL issues identified in the validation report.
+
+Focus on:
+1. Fix all discrepancies between the PRD and source documentation
+2. Remove or correct any inferred content that was flagged as inaccurate
+3. Add missing information that was identified
+4. Ensure response schemas match the live API response (if provided)
+5. Address every item in the "Recommended Fixes" section
+
+Output the complete corrected PRD in markdown format. Do not include explanations about what you changed - just output the corrected PRD."""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": correction_prompt}]
+    )
+
+    return response.content[0].text
+
+
+def parse_confidence_score(validation_result: str) -> str:
+    """Extract confidence score (HIGH/MEDIUM/LOW) from validation result."""
+    match = re.search(r'confidence[^:]*:\s*\*?\*?(HIGH|MEDIUM|LOW)\*?\*?', validation_result, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return "LOW"
+
+
 def get_api_key():
     """Get API key from secrets or user input."""
     if "ANTHROPIC_API_KEY" in st.secrets:
@@ -385,6 +453,20 @@ def main():
             "Enable PRD Validation",
             value=True,
             help="Run a second pass to validate PRD accuracy against source docs"
+        )
+
+        enable_correction = st.checkbox(
+            "Enable Auto-Correction",
+            value=True,
+            help="Automatically correct PRD if validation finds issues"
+        )
+
+        max_correction_attempts = st.number_input(
+            "Max Correction Attempts",
+            min_value=1,
+            max_value=5,
+            value=2,
+            help="Maximum correction iterations before stopping"
         )
 
         st.markdown("---")
@@ -537,12 +619,38 @@ def main():
 
             st.success("✓ PRD generated successfully!")
 
-            # Step 4: Validate PRD (if enabled)
+            # Step 4: Validate and correct PRD (if enabled)
             validation_result = None
+            correction_count = 0
+
             if enable_validation:
                 with st.spinner("Validating PRD accuracy..."):
                     validation_result = validate_prd(claude_api_key, prd_content, docs_content, api_test_result)
-                st.success("✓ Validation complete!")
+
+                # Auto-correction loop
+                if enable_correction:
+                    confidence = parse_confidence_score(validation_result)
+
+                    while confidence != "HIGH" and correction_count < max_correction_attempts:
+                        correction_count += 1
+                        with st.spinner(f"Correcting PRD (attempt {correction_count}/{max_correction_attempts})..."):
+                            prd_content = correct_prd(
+                                claude_api_key,
+                                prd_content,
+                                validation_result,
+                                docs_content,
+                                api_test_result
+                            )
+
+                        with st.spinner("Re-validating PRD..."):
+                            validation_result = validate_prd(claude_api_key, prd_content, docs_content, api_test_result)
+
+                        confidence = parse_confidence_score(validation_result)
+
+                if correction_count > 0:
+                    st.success(f"✓ Validation complete after {correction_count} correction(s)! (Confidence: {parse_confidence_score(validation_result)})")
+                else:
+                    st.success(f"✓ Validation complete! (Confidence: {parse_confidence_score(validation_result)})")
 
             # Display tabs
             if validation_result:
