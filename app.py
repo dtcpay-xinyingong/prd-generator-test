@@ -1,6 +1,7 @@
 """
 API PRD Generator - Streamlit App
 Generates API Integration PRDs using Claude AI.
+Optionally tests real APIs and includes actual response examples.
 """
 
 import streamlit as st
@@ -8,6 +9,11 @@ import anthropic
 import re
 import requests
 import html2text
+import hmac
+import hashlib
+import base64
+import time
+import json
 
 # Page config
 st.set_page_config(
@@ -53,9 +59,34 @@ When given API documentation content, you will:
    - Implementation checklist (actionable items for dev team)
    - Open questions (ambiguities or missing info)
 
+When real API response examples are provided, use them instead of documented examples.
+Clearly mark which examples are from live API testing vs documentation.
+
 Keep the PRD concise but actionable for a development team.
 
 Output format: Markdown"""
+
+# Provider configurations
+PROVIDERS = {
+    "none": {
+        "name": "None (Documentation Only)",
+        "auth_type": None,
+    },
+    "elliptic": {
+        "name": "Elliptic",
+        "auth_type": "hmac",
+        "base_url": "https://aml-api.elliptic.co",
+        "test_endpoint": "/v2/analyses/synchronous",
+    },
+    "generic_bearer": {
+        "name": "Generic (Bearer Token)",
+        "auth_type": "bearer",
+    },
+    "generic_api_key": {
+        "name": "Generic (API Key Header)",
+        "auth_type": "api_key",
+    },
+}
 
 
 def fetch_url_content(url: str) -> str:
@@ -66,15 +97,13 @@ def fetch_url_content(url: str) -> str:
     response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
 
-    # Convert HTML to markdown-like text
     h = html2text.HTML2Text()
     h.ignore_links = False
     h.ignore_images = True
-    h.body_width = 0  # Don't wrap lines
+    h.body_width = 0
 
     content = h.handle(response.text)
 
-    # Truncate if too long (Claude has context limits)
     max_chars = 100000
     if len(content) > max_chars:
         content = content[:max_chars] + "\n\n[Content truncated due to length...]"
@@ -82,14 +111,108 @@ def fetch_url_content(url: str) -> str:
     return content
 
 
-def generate_prd(url: str, api_key: str) -> str:
-    """Fetch API docs and generate PRD using Claude."""
+def elliptic_sign_request(method: str, path: str, body: str, secret: str) -> tuple:
+    """Generate Elliptic API signature."""
+    timestamp = int(time.time() * 1000)
 
-    # Step 1: Fetch the URL content
-    with st.spinner("Fetching API documentation..."):
-        docs_content = fetch_url_content(url)
+    path_lower = path.lower()
 
-    # Step 2: Send content to Claude for analysis
+    if body and body.strip():
+        try:
+            parsed = json.loads(body)
+            str_body = json.dumps(parsed, separators=(',', ':'))
+        except json.JSONDecodeError:
+            str_body = '{}'
+    else:
+        str_body = '{}'
+
+    text = f"{timestamp}{method.upper()}{path_lower}{str_body}"
+
+    key = base64.b64decode(secret)
+    signature = hmac.new(key, text.encode('utf-8'), hashlib.sha256)
+    signature_b64 = base64.b64encode(signature.digest()).decode('utf-8')
+
+    return signature_b64, timestamp
+
+
+def test_elliptic_api(api_key: str, api_secret: str, tx_hash: str, address: str) -> dict:
+    """Test Elliptic API and return response."""
+    base_url = "https://aml-api.elliptic.co"
+    path = "/v2/analyses/synchronous"
+
+    body = json.dumps({
+        "subject": {
+            "asset": "holistic",
+            "blockchain": "holistic",
+            "type": "transaction",
+            "hash": tx_hash,
+            "output_type": "address",
+            "output_address": address
+        },
+        "type": "source_of_funds",
+        "customer_reference": "prd-generator-test"
+    }, separators=(',', ':'))
+
+    signature, timestamp = elliptic_sign_request("POST", path, body, api_secret)
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-access-key": api_key,
+        "x-access-sign": signature,
+        "x-access-timestamp": str(timestamp)
+    }
+
+    response = requests.post(f"{base_url}{path}", headers=headers, data=body, timeout=30)
+
+    return {
+        "status_code": response.status_code,
+        "response": response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text,
+        "success": response.status_code == 200
+    }
+
+
+def test_generic_api(endpoint: str, method: str, auth_type: str, auth_value: str, body: str = None) -> dict:
+    """Test generic API with bearer or API key auth."""
+    headers = {"Content-Type": "application/json"}
+
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {auth_value}"
+    elif auth_type == "api_key":
+        headers["x-api-key"] = auth_value
+
+    if method.upper() == "GET":
+        response = requests.get(endpoint, headers=headers, timeout=30)
+    else:
+        response = requests.post(endpoint, headers=headers, data=body, timeout=30)
+
+    return {
+        "status_code": response.status_code,
+        "response": response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text,
+        "success": 200 <= response.status_code < 300
+    }
+
+
+def format_api_response(result: dict) -> str:
+    """Format API test result for inclusion in PRD."""
+    if not result["success"]:
+        return f"API test failed with status {result['status_code']}: {result['response']}"
+
+    response_json = json.dumps(result["response"], indent=2)
+
+    # Truncate if too long
+    if len(response_json) > 5000:
+        response_json = response_json[:5000] + "\n... [truncated]"
+
+    return f"""### Live API Response (Status: {result['status_code']})
+
+```json
+{response_json}
+```
+"""
+
+
+def generate_prd(url: str, api_key: str, docs_content: str, api_test_result: str = None) -> str:
+    """Generate PRD using Claude."""
     client = anthropic.Anthropic(api_key=api_key)
 
     prompt = f"""Generate a complete API Integration PRD based on the following API documentation.
@@ -99,14 +222,30 @@ Source URL: {url}
 ## API Documentation Content:
 
 {docs_content}
+"""
 
+    if api_test_result:
+        prompt += f"""
+
+---
+
+## Live API Test Results
+
+The following is a real response from testing the API:
+
+{api_test_result}
+
+Please incorporate this real response into the PRD as an example, clearly marking it as "Live API Response".
+"""
+
+    prompt += """
 ---
 
 Please generate a comprehensive but concise Integration PRD that includes:
 - Executive summary (objective, provider, complexity)
 - Quick reference table (base URL, auth, rate limits)
 - Authentication details
-- All key endpoints with request/response examples
+- All key endpoints with request/response examples (use live examples where available)
 - Data models
 - Error handling strategy
 - Rate limiting strategy
@@ -115,23 +254,20 @@ Please generate a comprehensive but concise Integration PRD that includes:
 
 Make it actionable for a development team."""
 
-    with st.spinner("Analyzing documentation and generating PRD..."):
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=8000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}]
-        )
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}]
+    )
 
     return response.content[0].text
 
 
 def get_api_key():
-    """Get API key from secrets (team) or user input."""
-    # Check for team API key in Streamlit secrets
+    """Get API key from secrets or user input."""
     if "ANTHROPIC_API_KEY" in st.secrets:
         return st.secrets["ANTHROPIC_API_KEY"], True
-    # Check environment variable
     import os
     if os.environ.get("ANTHROPIC_API_KEY"):
         return os.environ["ANTHROPIC_API_KEY"], True
@@ -140,9 +276,8 @@ def get_api_key():
 
 def main():
     st.title("📄 API PRD Generator")
-    st.markdown("Generate Integration PRDs for any API documentation URL")
+    st.markdown("Generate Integration PRDs with optional live API testing")
 
-    # Get API key (team or user)
     team_api_key, has_team_key = get_api_key()
 
     # Sidebar for settings
@@ -150,11 +285,11 @@ def main():
         st.header("Settings")
 
         if has_team_key:
-            st.success("✓ Team API key configured")
-            api_key = team_api_key
+            st.success("✓ Claude API key configured")
+            claude_api_key = team_api_key
         else:
-            api_key = st.text_input(
-                "Anthropic API Key",
+            claude_api_key = st.text_input(
+                "Claude API Key",
                 type="password",
                 help="Get your API key from console.anthropic.com"
             )
@@ -163,33 +298,91 @@ def main():
         st.markdown("### About")
         st.markdown(
             "This tool generates API Integration PRDs "
-            "using Claude AI. Simply paste an API documentation "
-            "URL and get a complete PRD for your development team."
+            "using Claude AI. Optionally test the real API "
+            "to include live response examples."
         )
 
-    # Main content
-    st.subheader("Enter API Documentation URL")
+    # Main content - two columns
+    col1, col2 = st.columns([1, 1])
 
-    url = st.text_input(
-        "API Documentation URL",
-        placeholder="https://developers.example.com/api/reference",
-        help="Paste the URL to the API documentation"
-    )
+    with col1:
+        st.subheader("API Documentation")
 
-    # Example URLs
-    with st.expander("Example URLs"):
-        st.markdown("""
-        - `https://developers.elliptic.co/reference/analysissync`
-        - `https://stripe.com/docs/api`
-        - `https://docs.github.com/en/rest`
-        """)
+        url = st.text_input(
+            "Documentation URL",
+            placeholder="https://developers.example.com/api/reference",
+            help="URL to the API documentation"
+        )
 
-    generate_btn = st.button("Generate PRD", type="primary")
+        with st.expander("Example URLs"):
+            st.markdown("""
+            - `https://developers.elliptic.co/reference/analysissync`
+            - `https://stripe.com/docs/api`
+            - `https://docs.github.com/en/rest`
+            """)
 
-    # Generate PRD
+    with col2:
+        st.subheader("API Testing (Optional)")
+
+        provider = st.selectbox(
+            "API Provider",
+            options=list(PROVIDERS.keys()),
+            format_func=lambda x: PROVIDERS[x]["name"],
+            help="Select provider for live API testing"
+        )
+
+        api_test_config = {}
+
+        if provider == "elliptic":
+            api_test_config["api_key"] = st.text_input(
+                "Elliptic API Key",
+                type="password",
+                help="x-access-key header value"
+            )
+            api_test_config["api_secret"] = st.text_input(
+                "Elliptic API Secret",
+                type="password",
+                help="Base64-encoded secret for HMAC signing"
+            )
+
+            with st.expander("Test Transaction (Optional)"):
+                api_test_config["tx_hash"] = st.text_input(
+                    "Transaction Hash",
+                    value="f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+                    help="Default: First BTC transaction (Satoshi → Hal Finney)"
+                )
+                api_test_config["address"] = st.text_input(
+                    "Address",
+                    value="1Q2TWHE3GMdB6BZKafqwxXtWAWgFt5Jvm3",
+                    help="Address to analyze"
+                )
+
+        elif provider in ["generic_bearer", "generic_api_key"]:
+            api_test_config["endpoint"] = st.text_input(
+                "Test Endpoint URL",
+                placeholder="https://api.example.com/endpoint",
+            )
+            api_test_config["method"] = st.selectbox(
+                "HTTP Method",
+                options=["GET", "POST"]
+            )
+            api_test_config["auth_value"] = st.text_input(
+                "API Key / Token",
+                type="password",
+            )
+            if api_test_config["method"] == "POST":
+                api_test_config["body"] = st.text_area(
+                    "Request Body (JSON)",
+                    placeholder='{"key": "value"}'
+                )
+
+    st.markdown("---")
+
+    generate_btn = st.button("Generate PRD", type="primary", use_container_width=True)
+
     if generate_btn:
-        if not api_key:
-            st.error("Please enter your Anthropic API key in the sidebar")
+        if not claude_api_key:
+            st.error("Please enter your Claude API key in the sidebar")
             return
 
         if not url:
@@ -201,11 +394,50 @@ def main():
             return
 
         try:
-            prd_content = generate_prd(url, api_key)
+            # Step 1: Fetch documentation
+            with st.spinner("Fetching API documentation..."):
+                docs_content = fetch_url_content(url)
+            st.success("✓ Documentation fetched")
 
-            st.success("PRD generated successfully!")
+            # Step 2: Test API (if configured)
+            api_test_result = None
 
-            # Display tabs for different views
+            if provider == "elliptic" and api_test_config.get("api_key") and api_test_config.get("api_secret"):
+                with st.spinner("Testing Elliptic API..."):
+                    result = test_elliptic_api(
+                        api_test_config["api_key"],
+                        api_test_config["api_secret"],
+                        api_test_config.get("tx_hash", "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16"),
+                        api_test_config.get("address", "1Q2TWHE3GMdB6BZKafqwxXtWAWgFt5Jvm3")
+                    )
+                    if result["success"]:
+                        st.success(f"✓ API test successful (Risk Score: {result['response'].get('risk_score', 'N/A')})")
+                        api_test_result = format_api_response(result)
+                    else:
+                        st.warning(f"API test failed: {result['status_code']}")
+
+            elif provider in ["generic_bearer", "generic_api_key"] and api_test_config.get("endpoint") and api_test_config.get("auth_value"):
+                with st.spinner("Testing API..."):
+                    result = test_generic_api(
+                        api_test_config["endpoint"],
+                        api_test_config.get("method", "GET"),
+                        "bearer" if provider == "generic_bearer" else "api_key",
+                        api_test_config["auth_value"],
+                        api_test_config.get("body")
+                    )
+                    if result["success"]:
+                        st.success("✓ API test successful")
+                        api_test_result = format_api_response(result)
+                    else:
+                        st.warning(f"API test failed: {result['status_code']}")
+
+            # Step 3: Generate PRD
+            with st.spinner("Generating PRD with Claude..."):
+                prd_content = generate_prd(url, claude_api_key, docs_content, api_test_result)
+
+            st.success("✓ PRD generated successfully!")
+
+            # Display tabs
             tab1, tab2 = st.tabs(["📄 PRD Document", "📋 Raw Markdown"])
 
             with tab1:
@@ -225,11 +457,11 @@ def main():
         except requests.exceptions.RequestException as e:
             st.error(f"Failed to fetch URL: {str(e)}")
         except anthropic.AuthenticationError:
-            st.error("Invalid API key. Please check your Anthropic API key.")
+            st.error("Invalid Claude API key. Please check your key.")
         except anthropic.RateLimitError:
-            st.error("Rate limit exceeded. Please wait a moment and try again.")
+            st.error("Rate limit exceeded. Please wait and try again.")
         except Exception as e:
-            st.error(f"Error generating PRD: {str(e)}")
+            st.error(f"Error: {str(e)}")
 
 
 if __name__ == "__main__":
