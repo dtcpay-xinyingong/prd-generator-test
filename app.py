@@ -53,6 +53,11 @@ When given API documentation content, you will:
      - Request parameters (table format)
      - Response schema/example
      - Endpoint-specific errors
+   - Sequence Diagram (Mermaid format) showing:
+     - Main request flow from application to API
+     - Authentication/signature generation step
+     - Rate limiting check
+     - Success and error response paths (including retries for 404, backoff for 429)
    - Data models (key objects used across endpoints)
    - Error handling strategy (table of codes, meanings, actions)
    - Rate limiting strategy (limits, headers, retry approach)
