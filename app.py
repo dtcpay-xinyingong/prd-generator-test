@@ -53,7 +53,7 @@ When given API documentation content, you will:
      - Request parameters (table format)
      - Response schema/example
      - Endpoint-specific errors
-   - Sequence Diagram (Mermaid format) showing:
+   - Sequence Diagram (REQUIRED - must include a ```mermaid code block) showing:
      - Main request flow from application to API
      - Authentication/signature generation step
      - Rate limiting check
@@ -249,6 +249,7 @@ Please generate a comprehensive but concise Integration PRD that includes:
 - Quick reference table (base URL, auth, rate limits)
 - Authentication details
 - All key endpoints with request/response examples (use live examples where available)
+- A Mermaid sequence diagram (```mermaid code block) showing the request flow, auth, rate limiting, and error handling paths
 - Data models
 - Error handling strategy
 - Rate limiting strategy
